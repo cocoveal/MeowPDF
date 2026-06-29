@@ -175,6 +175,25 @@ impl Image {
             return Ok(false);
         }
 
+        crate::globals::dlog(&format!(
+            "    DRAW id={} cell(row={},col={}) crop(x={},y={},w={},h={}) cells(c={},r={}) img={}x{} rect=(x={},y={},w={},h={})",
+            self.id,
+            1 + row0.floor() as usize,
+            1 + col0.floor() as usize,
+            cropx,
+            cropy,
+            cropw,
+            croph,
+            cols,
+            rows,
+            img_w,
+            img_h,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+        ));
+
         /* Do not forget that columns and rows are one-indexed in terminals */
         terminal_graphics_display_image(
             self.id,

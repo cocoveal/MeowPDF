@@ -1,7 +1,11 @@
 use crate::{drivers::graphics::GraphicsResponse, Config};
 use crossbeam_channel::Receiver;
 use crossterm::terminal::WindowSize;
-use std::sync::{atomic::AtomicBool, Mutex, OnceLock, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Mutex, OnceLock, RwLock,
+};
+use std::time::Instant;
 
 pub const HELP_MSG: &str = r#"meowpdf kitty terminal document viewer
 
@@ -69,6 +73,47 @@ width = 0.2
 "q" = "Quit"
 "Q" = "Quit"
 "#;
+
+/* Lightweight debug logging, enabled by setting MEOWPDF_DEBUG=1. Appends to
+ * /tmp/meowpdf-debug.log. Used to diagnose the draw/transmit handshake over SSH. */
+pub fn dlog(msg: &str) {
+    use std::io::Write as _;
+    if std::env::var("MEOWPDF_DEBUG").is_err() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/meowpdf-debug.log")
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
+/* Tracks user-input activity so slow page transfers can be deferred until the
+ * user is briefly idle. The transfer write holds the shared stdout lock for
+ * hundreds of milliseconds over SSH; running it during active scrolling would
+ * block the main loop's redraw. START_INSTANT is the process epoch; LAST_INPUT_MS
+ * is milliseconds-since-epoch of the most recent input. */
+pub static START_INSTANT: OnceLock<Instant> = OnceLock::new();
+pub static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/* Record that the user just interacted (scroll, key, mouse). */
+pub fn mark_input() {
+    if let Some(start) = START_INSTANT.get() {
+        LAST_INPUT_MS.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+}
+
+/* Milliseconds since the last user input. Large before any input has occurred,
+ * so startup transfers are never gated. */
+pub fn idle_ms() -> u64 {
+    match START_INSTANT.get() {
+        Some(start) => (start.elapsed().as_millis() as u64)
+            .saturating_sub(LAST_INPUT_MS.load(Ordering::Relaxed)),
+        None => u64::MAX,
+    }
+}
 
 /* Hate on me for those global singletons as much as you want. */
 pub static CONFIG: OnceLock<Config> = OnceLock::new();

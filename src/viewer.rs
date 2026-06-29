@@ -501,6 +501,7 @@ impl Viewer {
                 image.check().unwrap();
                 return Some(page);
             } else {
+                crate::globals::dlog(&format!("  draw page={} id={}", page, image.id()));
                 let has_displayed = image.display(rect).unwrap();
 
                 if has_displayed {

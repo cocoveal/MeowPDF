@@ -28,22 +28,6 @@ use crate::globals::*;
 mod config;
 use crate::config::*;
 
-/* Lightweight debug logging, enabled by setting MEOWPDF_DEBUG=1. Appends to
- * /tmp/meowpdf-debug.log. Used to diagnose the draw/transmit handshake over SSH. */
-fn dlog(msg: &str) {
-    use std::io::Write as _;
-    if std::env::var("MEOWPDF_DEBUG").is_err() {
-        return;
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/meowpdf-debug.log")
-    {
-        let _ = writeln!(f, "{}", msg);
-    }
-}
-
 use std::hash::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
@@ -140,6 +124,10 @@ fn main() {
     let random_u64 = RandomState::new().build_hasher().finish();
     SOFTWARE_ID.get_or_init(|| format!("{random_u64:X}"));
 
+    /* Process epoch for input-idle tracking (used to defer page transfers while
+     * the user is actively scrolling). */
+    START_INSTANT.get_or_init(std::time::Instant::now);
+
     /* ====================== Viewer - The core of this program ====================== */
     let (mut viewer, sender_rerender) = Viewer::new();
 
@@ -232,6 +220,9 @@ fn main() {
                     .expect("Could not receive rerender");
             }
             4 => {
+                /* Record interaction so in-flight page transfers defer until the
+                 * user stops scrolling (keeps redraws unblocked). */
+                mark_input();
                 let input = event_inputs.0.try_recv().expect("Could not receive input");
                 match input {
                     InputEvent::Key(key) => {
@@ -253,6 +244,7 @@ fn main() {
                 }
             }
             5 => {
+                mark_input();
                 current_mouse =
                     event_inputs.1.try_recv().expect("Could not receive mouse");
             }
@@ -324,44 +316,32 @@ fn main() {
                 displayed
             ));
         }
-        let n_displayed = displayed.len();
-        let mut timed_out = false;
-        for (i, page) in displayed.into_iter().enumerate() {
-            dlog(&format!(
-                "  awaiting response {}/{} (page {})",
-                i + 1,
-                n_displayed,
-                page
-            ));
-            /* Bounded wait: a draw command can occasionally produce no terminal
-             * response (e.g. a partial page placed at a document edge, which the
-             * terminal silently drops). Waiting forever on that ack hard-freezes
-             * the whole viewer. Real acks arrive in single-digit milliseconds even
-             * over SSH, so a short timeout keeps edge frames smooth while still
-             * guaranteeing the loop never blocks. */
-            match gr.recv_timeout(Duration::from_millis(80)) {
-                Ok(res) => {
-                    dlog(&format!("  got response (page {}): {:?}", page, res.payload()));
-                    if !res.payload().contains("OK") {
-                        viewer.schedule_transfer(page);
-                    }
-                }
-                Err(_) => {
-                    dlog(&format!(
-                        "  NO RESPONSE for page {} ({}/{}) within timeout -- continuing",
-                        page,
-                        i + 1,
-                        n_displayed
-                    ));
-                    timed_out = true;
-                    break;
-                }
+        /* Non-blocking acknowledgement handling.
+         *
+         * The terminal replies once per draw, but those replies lag behind a large
+         * page transfer over SSH (the terminal is busy ingesting the PNG). Blocking
+         * the render loop on them -- even with a timeout -- stalls every page
+         * crossing, and abandoning a late reply desyncs the positionally-matched
+         * reply stream, cascading into more false timeouts and spurious
+         * re-transmits. So we never wait: drain whatever replies have arrived and
+         * act only on errors. A non-OK reply means the terminal dropped an image
+         * (e.g. evicted it under memory pressure), so re-transmit the visible
+         * pages' bitmaps -- it self-corrects within a frame or two without ever
+         * blocking. */
+        let mut had_error = false;
+        while let Ok(res) = gr.try_recv() {
+            if !res.payload().contains("OK") {
+                dlog(&format!(
+                    "draw error reply: {:?} -> re-transmit visible pages",
+                    res.payload()
+                ));
+                had_error = true;
             }
         }
-        /* If we bailed out early, drain any late/stale responses so the next
-         * frame's response handshake stays aligned. */
-        if timed_out {
-            while gr.try_recv().is_ok() {}
+        if had_error {
+            for &page in &displayed {
+                viewer.schedule_transfer(page);
+            }
         }
     }
 

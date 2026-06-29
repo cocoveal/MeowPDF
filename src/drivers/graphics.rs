@@ -54,8 +54,6 @@ pub fn terminal_graphics_transfer_bitmap(
     data: &[u8],
     alpha: bool,
 ) -> Result<(), String> {
-    let mut handle = stdout().lock();
-
     /* Encode the raw bitmap as PNG and transmit it directly (t=d, f=100), inline
      * over the pty in chunks of up to 4096 base64 bytes, per the Kitty graphics
      * protocol.
@@ -75,6 +73,7 @@ pub fn terminal_graphics_transfer_bitmap(
         png::ColorType::Rgb
     };
 
+    let t_start = std::time::Instant::now();
     let mut png_buf: Vec<u8> = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut png_buf, width as u32, height as u32);
@@ -88,11 +87,27 @@ pub fn terminal_graphics_transfer_bitmap(
             .write_image_data(data)
             .map_err(|e| format!("PNG encode error: {}", e))?;
     }
+    let t_encoded = t_start.elapsed();
 
     /* Dimensions are carried inside the PNG, so s/v are omitted (f=100). */
     let encoded = STANDARD.encode(&png_buf);
     let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(4096).collect();
     let n = chunks.len();
+
+    /* Defer the (slow) write until the user has been briefly idle. The chunked
+     * write holds the shared stdout lock for hundreds of milliseconds over SSH;
+     * doing that during active scrolling blocks the main loop's per-frame redraw
+     * (the page-break stall). By taking the stdout lock only after input quiets
+     * down, scrolling of already-transmitted pages stays smooth and freshly
+     * rendered pages fill in as soon as scrolling pauses. */
+    while crate::globals::idle_ms() < 100
+        && crate::globals::RUNNING.load(std::sync::atomic::Ordering::Acquire)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+    let t_waited = t_start.elapsed() - t_encoded;
+
+    let mut handle = stdout().lock();
 
     for (idx, chunk) in chunks.iter().enumerate() {
         let more = if idx + 1 < n { 1 } else { 0 };
@@ -113,6 +128,18 @@ pub fn terminal_graphics_transfer_bitmap(
     }
 
     handle.flush().unwrap();
+    let t_total = t_start.elapsed();
+
+    crate::globals::dlog(&format!(
+        "TRANSFER id={} raw={}KB png={}KB b64={}KB encode={}ms waited={}ms write={}ms",
+        id,
+        data.len() / 1024,
+        png_buf.len() / 1024,
+        encoded.len() / 1024,
+        t_encoded.as_millis(),
+        t_waited.as_millis(),
+        (t_total - t_encoded - t_waited).as_millis(),
+    ));
 
     Ok(())
 }
