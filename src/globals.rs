@@ -115,6 +115,14 @@ pub fn idle_ms() -> u64 {
     }
 }
 
+/* True when running inside tmux, which does not natively relay the Kitty
+ * graphics protocol: graphics escape sequences must be wrapped in tmux's DCS
+ * passthrough envelope (and `set -g allow-passthrough on` must be configured). */
+pub static IN_TMUX: OnceLock<bool> = OnceLock::new();
+pub fn in_tmux() -> bool {
+    *IN_TMUX.get_or_init(|| std::env::var("TMUX").is_ok())
+}
+
 /* Hate on me for those global singletons as much as you want. */
 pub static CONFIG: OnceLock<Config> = OnceLock::new();
 pub static RECEIVER_GR: OnceLock<Mutex<Receiver<GraphicsResponse>>> = OnceLock::new();

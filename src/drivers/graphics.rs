@@ -5,11 +5,42 @@ use std::{
     time::Duration,
 };
 
+use crate::globals::in_tmux;
 use crate::RECEIVER_GR;
+
+/* Write one complete Kitty graphics escape sequence, wrapping it in tmux's DCS
+ * passthrough envelope (`\ePtmux; ... \e\\`, with inner ESC bytes doubled) when
+ * running inside tmux. tmux otherwise swallows the Kitty graphics protocol;
+ * passthrough forwards the sequence to the outer terminal. Requires
+ * `set -g allow-passthrough on`. The payload is written in spans so the per-byte
+ * scan never turns into per-byte writes. */
+fn write_graphics_seq(handle: &mut impl Write, seq: &[u8]) -> std::io::Result<()> {
+    if !in_tmux() {
+        return handle.write_all(seq);
+    }
+    handle.write_all(b"\x1BPtmux;")?;
+    let mut start = 0;
+    for (i, &b) in seq.iter().enumerate() {
+        if b == 0x1B {
+            handle.write_all(&seq[start..i])?;
+            handle.write_all(b"\x1B\x1B")?;
+            start = i + 1;
+        }
+    }
+    handle.write_all(&seq[start..])?;
+    handle.write_all(b"\x1B\\")
+}
 
 /* Should be executed only after uncooking the terminal. This method expects the
  * terminal that a non-blocking and unbuffered read from stdin is possible */
 pub fn terminal_graphics_test_support() -> Result<(), String> {
+    /* Inside tmux the graphics-query reply does not reliably route back to the
+     * application, so the probe would always time out. We know the outer terminal
+     * supports the protocol (graphics are wrapped for passthrough), so skip it. */
+    if in_tmux() {
+        return Ok(());
+    }
+
     let mut handle1 = stdout().lock();
     handle1
         .write_all(b"\x1B_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1B\\")
@@ -40,7 +71,9 @@ pub fn terminal_graphics_test_support() -> Result<(), String> {
 #[allow(dead_code)]
 pub fn terminal_graphics_deallocate_id(id: usize) -> Result<(), String> {
     let mut handle = stdout().lock();
-    write!(handle, "\x1B_Ga=d,d=I,i={};\x1B\\", id).unwrap();
+    let mut seq: Vec<u8> = Vec::new();
+    write!(seq, "\x1B_Ga=d,d=I,i={};\x1B\\", id).unwrap();
+    write_graphics_seq(&mut handle, &seq).unwrap();
 
     handle.flush().unwrap();
 
@@ -112,19 +145,24 @@ pub fn terminal_graphics_transfer_bitmap(
     for (idx, chunk) in chunks.iter().enumerate() {
         let more = if idx + 1 < n { 1 } else { 0 };
 
+        /* Build the full escape sequence for this chunk, then write it (wrapped
+         * for tmux passthrough when needed). Each chunk must be wrapped as its
+         * own complete sequence. */
+        let mut seq: Vec<u8> = Vec::with_capacity(chunk.len() + 48);
         if idx == 0 {
             if n == 1 {
                 /* Single chunk: omit the m key entirely */
-                write!(handle, "\x1B_Gq=2,f=100,i={},t=d;", id).unwrap();
+                write!(seq, "\x1B_Gq=2,f=100,i={},t=d;", id).unwrap();
             } else {
-                write!(handle, "\x1B_Gq=2,f=100,i={},t=d,m=1;", id).unwrap();
+                write!(seq, "\x1B_Gq=2,f=100,i={},t=d,m=1;", id).unwrap();
             }
         } else {
-            write!(handle, "\x1B_Gm={};", more).unwrap();
+            write!(seq, "\x1B_Gm={};", more).unwrap();
         }
+        seq.extend_from_slice(chunk);
+        seq.extend_from_slice(b"\x1B\\");
 
-        handle.write_all(chunk).unwrap();
-        handle.write_all(b"\x1B\\").unwrap();
+        write_graphics_seq(&mut handle, &seq).unwrap();
     }
 
     handle.flush().unwrap();
@@ -156,18 +194,25 @@ pub fn terminal_graphics_display_image(
 ) -> Result<(), String> {
     let mut handle = stdout().lock();
 
-    write!(handle, "\x1B[s\x1B[{};{}H", row, col).unwrap();
-
-    /* Z-index < -1,073,741,824 will make the images to be drawn behind
-     * cells with colored background */
+    /* Build the placement as one sequence: save cursor, move to the target cell,
+     * put the image at the cursor (C=1 keeps the cursor), restore.
+     *
+     * The whole sequence -- including the cursor move -- must go through tmux
+     * passthrough. Otherwise the cursor move is consumed by tmux while the image
+     * put reaches the OUTER terminal, which then places the image at its own
+     * (unsynced) cursor position -- the misalignment. Passing the cursor move
+     * through too positions the outer terminal's cursor right before the put.
+     * (Z-index < -1,073,741,824 keeps images behind colored-background cells.) */
+    let mut seq: Vec<u8> = Vec::new();
+    write!(seq, "\x1B[s\x1B[{};{}H", row, col).unwrap();
     write!(
-        handle,
+        seq,
         "\x1B_Gz=-1073741825,a=p,C=1,i={},x={},y={},w={},h={},c={},r={};\x1B\\",
         id, rect.0, rect.1, rect.2, rect.3, c, r
     )
     .unwrap();
-
-    handle.write_all(b"\x1B[u").unwrap();
+    seq.extend_from_slice(b"\x1B[u");
+    write_graphics_seq(&mut handle, &seq).unwrap();
 
     handle
         .flush()

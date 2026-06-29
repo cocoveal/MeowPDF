@@ -5,7 +5,12 @@ use crossterm::Command;
 pub struct ClearImages;
 impl Command for ClearImages {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        f.write_str("\x1B_Ga=d,d=a\x1B\\")
+        if crate::globals::in_tmux() {
+            /* tmux passthrough: \ePtmux; + (inner ESC bytes doubled) + \e\\ */
+            f.write_str("\x1BPtmux;\x1B\x1B_Ga=d,d=a\x1B\x1B\\\x1B\\")
+        } else {
+            f.write_str("\x1B_Ga=d,d=a\x1B\\")
+        }
     }
 }
 
