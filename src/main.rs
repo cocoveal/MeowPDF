@@ -58,6 +58,33 @@ fn main() {
         _ => (),
     }
 
+    /* ===== Validate the file BEFORE cooking the terminal, so a missing path or a
+     * non-PDF argument errors cleanly to stderr instead of failing deep in the
+     * renderer thread with the terminal already in raw/alt-screen mode (which
+     * leaves it wedged). Per the PDF convention, the "%PDF-" marker must appear
+     * within the first 1024 bytes. ===== */
+    {
+        use std::io::Read;
+        let path = std::path::Path::new(&arg);
+        if !path.is_file() {
+            let reason = if path.is_dir() {
+                "is a directory"
+            } else {
+                "no such file"
+            };
+            eprintln!("meowpdf: cannot open '{}': {}", arg, reason);
+            std::process::exit(1);
+        }
+        let mut head = [0u8; 1024];
+        let n = std::fs::File::open(path)
+            .and_then(|mut f| f.read(&mut head))
+            .unwrap_or(0);
+        if !head[..n].windows(5).any(|w| w == b"%PDF-") {
+            eprintln!("meowpdf: '{}' is not a PDF file", arg);
+            std::process::exit(1);
+        }
+    }
+
     /* ============================= Uncook the terminal ============================= */
     enable_raw_mode().expect("Could not cook the terminal");
     execute!(io::stdout(), EnterAlternateScreen).expect("Could not enter alt mode");
