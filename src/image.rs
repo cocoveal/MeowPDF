@@ -155,14 +155,34 @@ impl Image {
             return Ok(false);
         }
 
+        /* Clamp the crop rectangle to the actual bitmap bounds. Near a document
+         * edge the computed crop can run past the image (cropy + croph >
+         * image height), which the terminal silently rejects -- producing a draw
+         * with no acknowledgement that would otherwise stall the render loop. */
+        let img_w = self.dimensions.0 as usize + 2 * padding;
+        let img_h = self.dimensions.1 as usize + 2 * padding;
+        let cropx = cropx.min(img_w);
+        let cropy = cropy.min(img_h);
+        let cropw = cropw.min(img_w - cropx);
+        let croph = croph.min(img_h - cropy);
+
+        let cols = (col1.ceil() - col0.floor()) as usize;
+        let rows = (row1.ceil() - row0.floor()) as usize;
+
+        /* A placement that collapses to zero cells or a zero-sized crop yields a
+         * graphics command the terminal will not acknowledge. Skip it. */
+        if cols == 0 || rows == 0 || cropw == 0 || croph == 0 {
+            return Ok(false);
+        }
+
         /* Do not forget that columns and rows are one-indexed in terminals */
         terminal_graphics_display_image(
             self.id,
             1 + col0.floor() as usize,
             1 + row0.floor() as usize,
             (cropx, cropy, cropw, croph),
-            (col1.ceil() - col0.floor()) as usize,
-            (row1.ceil() - row0.floor()) as usize,
+            cols,
+            rows,
         )?;
 
         Ok(true)

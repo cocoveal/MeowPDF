@@ -1,12 +1,11 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::{
     collections::HashMap,
-    fs::File,
     io::{stdout, Write},
     time::Duration,
 };
 
-use crate::{RECEIVER_GR, SOFTWARE_ID};
+use crate::RECEIVER_GR;
 
 /* Should be executed only after uncooking the terminal. This method expects the
  * terminal that a non-blocking and unbuffered read from stdin is possible */
@@ -56,35 +55,62 @@ pub fn terminal_graphics_transfer_bitmap(
     alpha: bool,
 ) -> Result<(), String> {
     let mut handle = stdout().lock();
-    let mut tmp_file_path = std::env::temp_dir();
 
-    tmp_file_path.push(format!(
-        "tty-graphics-protocol-{}-{}",
-        SOFTWARE_ID.get().unwrap(),
-        id
-    ));
+    /* Encode the raw bitmap as PNG and transmit it directly (t=d, f=100), inline
+     * over the pty in chunks of up to 4096 base64 bytes, per the Kitty graphics
+     * protocol.
+     *
+     * Two reasons for direct PNG transmission instead of the upstream temp-file
+     * medium (t=t):
+     *   1. Temp files reference a path that is only valid on the local machine,
+     *      so they break over SSH (the remote terminal cannot read or delete the
+     *      path, which also hangs the upstream busy-wait loop forever).
+     *   2. Raw RGBA pixels are huge -- a single page is several megabytes -- which
+     *      saturates the SSH pty and starves input handling. PNG compresses a
+     *      document page by an order of magnitude, so it stays responsive over the
+     *      wire. `Compression::Fast` keeps encoding latency low on the host. */
+    let color = if alpha {
+        png::ColorType::Rgba
+    } else {
+        png::ColorType::Rgb
+    };
 
-    /* Wait for the file to get automatically get deleted by Kitty from a previous
-     * render instance of this exact image with the same ID. If this is not done
-     * this will lead to extreme bugs where the Kitty terminal can crash */
-    while tmp_file_path.as_path().exists() {}
-
+    let mut png_buf: Vec<u8> = Vec::new();
     {
-        let mut tmp_file = File::create(tmp_file_path.as_path()).unwrap();
-        tmp_file.write_all(data).unwrap();
+        let mut encoder = png::Encoder::new(&mut png_buf, width as u32, height as u32);
+        encoder.set_color(color);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("PNG header error: {}", e))?;
+        writer
+            .write_image_data(data)
+            .map_err(|e| format!("PNG encode error: {}", e))?;
     }
 
-    /* First chunk with bitmap metadata */
-    write!(
-        handle,
-        "\x1B_Gq=2,f={},i={},s={},v={},t=t;{}\x1B\\",
-        if alpha { 32 } else { 24 },
-        id,
-        width,
-        height,
-        STANDARD.encode(tmp_file_path.to_str().unwrap())
-    )
-    .unwrap();
+    /* Dimensions are carried inside the PNG, so s/v are omitted (f=100). */
+    let encoded = STANDARD.encode(&png_buf);
+    let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(4096).collect();
+    let n = chunks.len();
+
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let more = if idx + 1 < n { 1 } else { 0 };
+
+        if idx == 0 {
+            if n == 1 {
+                /* Single chunk: omit the m key entirely */
+                write!(handle, "\x1B_Gq=2,f=100,i={},t=d;", id).unwrap();
+            } else {
+                write!(handle, "\x1B_Gq=2,f=100,i={},t=d,m=1;", id).unwrap();
+            }
+        } else {
+            write!(handle, "\x1B_Gm={};", more).unwrap();
+        }
+
+        handle.write_all(chunk).unwrap();
+        handle.write_all(b"\x1B\\").unwrap();
+    }
 
     handle.flush().unwrap();
 

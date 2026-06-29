@@ -28,6 +28,22 @@ use crate::globals::*;
 mod config;
 use crate::config::*;
 
+/* Lightweight debug logging, enabled by setting MEOWPDF_DEBUG=1. Appends to
+ * /tmp/meowpdf-debug.log. Used to diagnose the draw/transmit handshake over SSH. */
+fn dlog(msg: &str) {
+    use std::io::Write as _;
+    if std::env::var("MEOWPDF_DEBUG").is_err() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/meowpdf-debug.log")
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
 use std::hash::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
@@ -241,18 +257,30 @@ fn main() {
                     event_inputs.1.try_recv().expect("Could not receive mouse");
             }
             6 => {
-                let (width, height) = event_inputs
+                /* Drain the resize notification. crossterm's Resize event carries
+                 * columns/rows (cells), NOT the pixel dimensions that the geometry
+                 * math in image.rs depends on. Writing those cell counts into the
+                 * pixel fields collapses pxpercol/pxperrow to ~1, which destroys the
+                 * aspect ratio and page positioning. Instead, re-query the real
+                 * terminal size (rows, columns, and pixel width/height) so every
+                 * field stays consistent. */
+                let _ = event_inputs
                     .3
                     .try_recv()
                     .expect("Could not receive from win-size");
 
-                let mut handle = TERMINAL_SIZE
-                    .get()
-                    .unwrap()
-                    .write()
-                    .expect("Could not get win sie handle");
-                handle.width = width;
-                handle.height = height;
+                if let Ok(new_size) = window_size() {
+                    dlog(&format!(
+                        "RESIZE -> rows={} cols={} xpix={} ypix={}",
+                        new_size.rows, new_size.columns, new_size.width, new_size.height
+                    ));
+                    let mut handle = TERMINAL_SIZE
+                        .get()
+                        .unwrap()
+                        .write()
+                        .expect("Could not get win size handle");
+                    *handle = new_size;
+                }
             }
             _ => unreachable!(),
         };
@@ -289,13 +317,51 @@ fn main() {
         let displayed = viewer
             .display_pages(&renderer)
             .expect("Could not display pages");
-        for page in displayed {
-            let res = gr.recv().unwrap();
-            if res.payload().contains("OK") {
-                continue;
+        if !displayed.is_empty() {
+            dlog(&format!(
+                "display_pages -> {} page(s): {:?}",
+                displayed.len(),
+                displayed
+            ));
+        }
+        let n_displayed = displayed.len();
+        let mut timed_out = false;
+        for (i, page) in displayed.into_iter().enumerate() {
+            dlog(&format!(
+                "  awaiting response {}/{} (page {})",
+                i + 1,
+                n_displayed,
+                page
+            ));
+            /* Bounded wait: a draw command can occasionally produce no terminal
+             * response (e.g. a partial page placed at a document edge, which the
+             * terminal silently drops). Waiting forever on that ack hard-freezes
+             * the whole viewer. Real acks arrive in single-digit milliseconds even
+             * over SSH, so a short timeout keeps edge frames smooth while still
+             * guaranteeing the loop never blocks. */
+            match gr.recv_timeout(Duration::from_millis(80)) {
+                Ok(res) => {
+                    dlog(&format!("  got response (page {}): {:?}", page, res.payload()));
+                    if !res.payload().contains("OK") {
+                        viewer.schedule_transfer(page);
+                    }
+                }
+                Err(_) => {
+                    dlog(&format!(
+                        "  NO RESPONSE for page {} ({}/{}) within timeout -- continuing",
+                        page,
+                        i + 1,
+                        n_displayed
+                    ));
+                    timed_out = true;
+                    break;
+                }
             }
-
-            viewer.schedule_transfer(page);
+        }
+        /* If we bailed out early, drain any late/stale responses so the next
+         * frame's response handshake stays aligned. */
+        if timed_out {
+            while gr.try_recv().is_ok() {}
         }
     }
 
@@ -429,10 +495,12 @@ fn handle_key(
         }
         ConfigAction::ZoomIn => {
             viewer.scale(config.viewer.scale_amount);
+            dlog(&format!("ZOOM IN  -> scale={}", viewer.get_scale()));
             false
         }
         ConfigAction::ZoomOut => {
             viewer.scale(-config.viewer.scale_amount);
+            dlog(&format!("ZOOM OUT -> scale={}", viewer.get_scale()));
             false
         }
     }
